@@ -12,10 +12,11 @@ services:
       LOG_LEVEL: "DEBUG"
 
   # SNI/HTTP proxy: routes TLS by SNI, HTTP by Host (no TLS termination)
-  sni-proxy:
+   sni-proxy:
     image: haproxy:lts
     container_name: sni-proxy
-    network_mode: host            # binds :80 and :443 on the host
+    network_mode: host
     restart: unless-stopped
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
