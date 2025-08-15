@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-DNS + SNI/HTTP Transparent Proxy — Proxy Everything
-===================================================
+DNS + SNI/HTTP Transparent Proxy — Proxy Everything (with loop-proof resolver)
+==============================================================================
 
-What it does
-------------
-- DNS server replies to *every* A/AAAA query with your proxy IP(s).
-- HTTP transparent proxy (uses Host header) forwards to the real origin.
+What this does
+--------------
+- DNS server: replies to *every* A/AAAA query with your proxy IP(s).
+- HTTP transparent proxy (uses Host header) forwards to the origin.
 - TLS SNI proxy forwards by SNI without terminating TLS.
+- Built-in upstream DNS resolver that **never** asks this server (avoids loops).
 
 Limits
 ------
-- Not a full VPN: won’t handle raw IP connections, non-HTTP(S) protocols,
-  or clients using DoH/DoT.
-- HTTP/3 (QUIC/UDP/443) is not proxied here.
+- Not a full VPN: won’t capture raw IP connections, non-HTTP(S) protocols,
+  or clients using DoH/DoT. HTTP/3 (QUIC/UDP/443) is not proxied.
 
-Quick start
------------
+Requirements
+------------
 pip install dnslib
-export SINK_IPV4=203.0.113.10  # your server’s public IPv4
-sudo -E python3 proxy_everything.py
+
+Minimal env to set
+------------------
+export SINK_IPV4="YOUR.SERVER.IPv4"
+# optional:
+# export SINK_IPV6="YOUR:SERVER:IPv6"
+# export LOG_LEVEL=DEBUG
 """
 
 import asyncio
@@ -29,7 +34,7 @@ import os
 import socket
 import struct
 import sys
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from dnslib import DNSRecord, RR, A, AAAA, QTYPE, RCODE
 
@@ -49,6 +54,15 @@ TLS_PORT  = int(os.getenv("TLS_PORT",  "443"))
 DNS_TTL     = int(os.getenv("DNS_TTL", "30"))
 LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Public resolvers used by the built-in upstream resolver (for proxy connections)
+UPSTREAM_DNS: List[Tuple[str, int]] = [
+    ("1.1.1.1", 53),   # Cloudflare
+    ("9.9.9.9", 53),   # Quad9
+    ("8.8.8.8", 53),   # Google
+]
+
+UPSTREAM_TIMEOUT = 2.0  # seconds per resolver
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -61,8 +75,50 @@ def _valid_ip(ip: str, version: int) -> bool:
     except ValueError:
         return False
 
+
+def _dns_query_first(host: str, qtype: str) -> Optional[str]:
+    """
+    Do a bare UDP DNS query for host/qtype against known public resolvers.
+    Returns the first IP (as string) or None.
+    """
+    q = DNSRecord.question(host, qtype)
+    packet = q.pack()
+    for server, port in UPSTREAM_DNS:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(UPSTREAM_TIMEOUT)
+                s.sendto(packet, (server, port))
+                data, _ = s.recvfrom(4096)
+            reply = DNSRecord.parse(data)
+            for rr in reply.rr:
+                if QTYPE[rr.rtype] == qtype:
+                    ip = str(rr.rdata)
+                    # quick sanity
+                    try:
+                        ipaddress.ip_address(ip)
+                        return ip
+                    except ValueError:
+                        continue
+        except Exception:
+            continue
+    return None
+
+
+def resolve_upstream_ip(host: str) -> Optional[str]:
+    """
+    Resolve host to a concrete IP using public resolvers.
+    Prefer A (IPv4), then AAAA (IPv6). Returns IP string or None.
+    """
+    # strip trailing dot if present
+    host = host.rstrip(".")
+    ip = _dns_query_first(host, "A")
+    if ip:
+        return ip
+    return _dns_query_first(host, "AAAA")
+
+
 # ---------------------------------------------------------------------------
-# DNS server (UDP)
+# DNS server (UDP) — answers everything with SINK IPs
 # ---------------------------------------------------------------------------
 class DNSDatagramProtocol(asyncio.DatagramProtocol):
     """
@@ -108,6 +164,7 @@ class DNSDatagramProtocol(asyncio.DatagramProtocol):
                 pass
             logging.error(f"DNS reply error: {e}")
 
+
 # ---------------------------------------------------------------------------
 # HTTP transparent proxy (Host header based)
 # ---------------------------------------------------------------------------
@@ -124,7 +181,13 @@ class HTTPTransparentProxy:
                 writer.close(); await writer.wait_closed(); return
             port = port or 80
 
-            upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
+            upstream_ip = resolve_upstream_ip(host)
+            if not upstream_ip:
+                logging.debug(f"HTTP: upstream resolve failed for {host}")
+                writer.close(); await writer.wait_closed(); return
+
+            upstream_reader, upstream_writer = await asyncio.open_connection(upstream_ip, port)
+            # We forward the original request bytes (preserves Host header)
             upstream_writer.write(head)
             await upstream_writer.drain()
 
@@ -161,7 +224,7 @@ class HTTPTransparentProxy:
                     break
             if not host_line:
                 return None, None
-            if ":" in host_line and not host_line.endswith(']'):
+            if ":" in host_line and not host_line.endswith(']'):  # rudimentary IPv6 bracket rule
                 host, port_s = host_line.rsplit(":", 1)
                 try:
                     return host.strip(), int(port_s)
@@ -187,6 +250,7 @@ class HTTPTransparentProxy:
             except Exception:
                 pass
 
+
 # ---------------------------------------------------------------------------
 # TLS SNI transparent proxy (no TLS termination)
 # ---------------------------------------------------------------------------
@@ -205,7 +269,12 @@ class TLSSNIProxy:
             if not sni_host:
                 return await self._close(client_writer)
 
-            upstream_reader, upstream_writer = await asyncio.open_connection(sni_host, self.default_port)
+            upstream_ip = resolve_upstream_ip(sni_host)
+            if not upstream_ip:
+                logging.debug(f"TLS: upstream resolve failed for {sni_host}")
+                return await self._close(client_writer)
+
+            upstream_reader, upstream_writer = await asyncio.open_connection(upstream_ip, self.default_port)
             upstream_writer.write(hello)
             await upstream_writer.drain()
 
@@ -312,6 +381,7 @@ class TLSSNIProxy:
             w.close(); await w.wait_closed()
         except Exception:
             pass
+
 
 # ---------------------------------------------------------------------------
 # Main
