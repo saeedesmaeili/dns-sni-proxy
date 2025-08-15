@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-DNS + SNI/HTTP Transparent Proxy ("DNS-based pseudo‑VPN")
-=========================================================
+DNS + SNI/HTTP Transparent Proxy — Proxy Everything
+===================================================
 
-⚠️ What this actually does (and its limits)
--------------------------------------------
-- Acts as a DNS server that answers every A/AAAA query with your proxy IP.
-- Transparent HTTP proxy (reads Host header) and TLS SNI proxy (forwards based on SNI without TLS termination).
-- Not a full VPN: won’t handle raw IP, non-HTTP(S) protocols, or clients using DoH/DoT.
+What it does
+------------
+- DNS server replies to *every* A/AAAA query with your proxy IP(s).
+- HTTP transparent proxy (uses Host header) forwards to the real origin.
+- TLS SNI proxy forwards by SNI without terminating TLS.
+
+Limits
+------
+- Not a full VPN: won’t handle raw IP connections, non-HTTP(S) protocols,
+  or clients using DoH/DoT.
+- HTTP/3 (QUIC/UDP/443) is not proxied here.
 
 Quick start
 -----------
-1) pip install dnslib
-2) export SINK_IPV4=... (and optionally SINK_IPV6)
-3) sudo -E python3 dns_sni_proxy.py
-
-License: MIT
+pip install dnslib
+export SINK_IPV4=203.0.113.10  # your server’s public IPv4
+sudo -E python3 proxy_everything.py
 """
 
 import asyncio
@@ -29,24 +33,25 @@ from typing import Optional, Tuple
 
 from dnslib import DNSRecord, RR, A, AAAA, QTYPE, RCODE
 
-SINK_IPV4 = os.getenv("SINK_IPV4", "")
-SINK_IPV6 = os.getenv("SINK_IPV6", "")
-DNS_UPSTREAM = os.getenv("DNS_UPSTREAM", "1.1.1.1")
-ALLOWLIST = [d.strip().lower() for d in os.getenv("ALLOWLIST", "").split(",") if d.strip()]
+# ---------------------------------------------------------------------------
+# Config via environment variables
+# ---------------------------------------------------------------------------
+SINK_IPV4 = os.getenv("SINK_IPV4", "")      # IP to return for all A queries
+SINK_IPV6 = os.getenv("SINK_IPV6", "")      # IP to return for all AAAA queries
 
-DNS_HOST = os.getenv("DNS_HOST", "0.0.0.0")
-DNS_PORT = int(os.getenv("DNS_PORT", "53"))
+DNS_HOST  = os.getenv("DNS_HOST",  "0.0.0.0")
+DNS_PORT  = int(os.getenv("DNS_PORT",  "53"))
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "80"))
-TLS_HOST = os.getenv("TLS_HOST", "0.0.0.0")
-TLS_PORT = int(os.getenv("TLS_PORT", "443"))
+TLS_HOST  = os.getenv("TLS_HOST",  "0.0.0.0")
+TLS_PORT  = int(os.getenv("TLS_PORT",  "443"))
 
-DNS_TTL = int(os.getenv("DNS_TTL", "30"))
-DNS_TIMEOUT = float(os.getenv("DNS_TIMEOUT", "2.5"))
+DNS_TTL     = int(os.getenv("DNS_TTL", "30"))
+LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO").upper()
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _valid_ip(ip: str, version: int) -> bool:
     if not ip:
         return False
@@ -56,17 +61,14 @@ def _valid_ip(ip: str, version: int) -> bool:
     except ValueError:
         return False
 
-
-def domain_in_allowlist(qname: str) -> bool:
-    return True
-    qname = qname.rstrip('.').lower()
-    for suffix in ALLOWLIST:
-        if qname == suffix or qname.endswith("." + suffix):
-            return True
-    return False
-
-
+# ---------------------------------------------------------------------------
+# DNS server (UDP)
+# ---------------------------------------------------------------------------
 class DNSDatagramProtocol(asyncio.DatagramProtocol):
+    """
+    Always replies with SINK_IPV4/6 (if set) for A/AAAA.
+    No upstream forwarding.
+    """
     def __init__(self, sink_ipv4: str, sink_ipv6: str):
         super().__init__()
         self.sink_ipv4 = sink_ipv4 if _valid_ip(sink_ipv4, 4) else None
@@ -86,15 +88,6 @@ class DNSDatagramProtocol(asyncio.DatagramProtocol):
             return
 
         try:
-            if any(domain_in_allowlist(str(q.qname)) for q in request.questions):
-                resp = self.forward_upstream(data)
-                if resp:
-                    self.transport.sendto(resp, addr)
-                return
-        except Exception as e:
-            logging.warning(f"DNS upstream forward failed, falling back to sink: {e}")
-
-        try:
             reply = request.reply()
             for q in request.questions:
                 qname = q.qname
@@ -102,8 +95,10 @@ class DNSDatagramProtocol(asyncio.DatagramProtocol):
                     reply.add_answer(RR(qname, QTYPE.A, rdata=A(self.sink_ipv4), ttl=DNS_TTL))
                 elif q.qtype == QTYPE.AAAA and self.sink_ipv6:
                     reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(self.sink_ipv6), ttl=DNS_TTL))
-            packet = reply.pack()
-            self.transport.sendto(packet, addr)
+                else:
+                    # For other types: reply NOERROR with no answers
+                    pass
+            self.transport.sendto(reply.pack(), addr)
         except Exception as e:
             try:
                 servfail = request.reply()
@@ -113,13 +108,9 @@ class DNSDatagramProtocol(asyncio.DatagramProtocol):
                 pass
             logging.error(f"DNS reply error: {e}")
 
-    def forward_upstream(self, packet: bytes) -> Optional[bytes]:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(DNS_TIMEOUT)
-            s.sendto(packet, (DNS_UPSTREAM, 53))
-            return s.recv(4096)
-
-
+# ---------------------------------------------------------------------------
+# HTTP transparent proxy (Host header based)
+# ---------------------------------------------------------------------------
 class HTTPTransparentProxy:
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
@@ -127,18 +118,27 @@ class HTTPTransparentProxy:
             head = await self._read_until_double_crlf(reader, max_bytes=65536)
             if not head:
                 writer.close(); await writer.wait_closed(); return
+
             host, port = self._extract_host_port(head)
             if not host:
                 writer.close(); await writer.wait_closed(); return
             port = port or 80
+
             upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
-            upstream_writer.write(head); await upstream_writer.drain()
-            await asyncio.gather(self._pipe(reader, upstream_writer), self._pipe(upstream_reader, writer))
+            upstream_writer.write(head)
+            await upstream_writer.drain()
+
+            await asyncio.gather(
+                self._pipe(reader, upstream_writer),
+                self._pipe(upstream_reader, writer),
+            )
         except Exception as e:
             logging.debug(f"HTTP error with {peer}: {e}")
         finally:
-            with contextlib_silent():
+            try:
                 writer.close(); await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _read_until_double_crlf(self, reader: asyncio.StreamReader, max_bytes=65536) -> bytes:
         buf = bytearray()
@@ -177,14 +177,19 @@ class HTTPTransparentProxy:
                 data = await reader.read(65536)
                 if not data:
                     break
-                writer.write(data); await writer.drain()
+                writer.write(data)
+                await writer.drain()
         except Exception:
             pass
         finally:
-            with contextlib_silent():
+            try:
                 writer.close(); await writer.wait_closed()
+            except Exception:
+                pass
 
-
+# ---------------------------------------------------------------------------
+# TLS SNI transparent proxy (no TLS termination)
+# ---------------------------------------------------------------------------
 class TLSSNIProxy:
     def __init__(self, default_port: int = 443):
         self.default_port = default_port
@@ -195,12 +200,19 @@ class TLSSNIProxy:
             hello = await self._read_client_hello(client_reader)
             if not hello:
                 return await self._close(client_writer)
+
             sni_host = self._parse_sni(hello)
             if not sni_host:
                 return await self._close(client_writer)
+
             upstream_reader, upstream_writer = await asyncio.open_connection(sni_host, self.default_port)
-            upstream_writer.write(hello); await upstream_writer.drain()
-            await asyncio.gather(self._pipe(client_reader, upstream_writer), self._pipe(upstream_reader, client_writer))
+            upstream_writer.write(hello)
+            await upstream_writer.drain()
+
+            await asyncio.gather(
+                self._pipe(client_reader, upstream_writer),
+                self._pipe(upstream_reader, client_writer),
+            )
         except Exception as e:
             logging.debug(f"TLS error with {peer}: {e}")
         finally:
@@ -217,8 +229,10 @@ class TLSSNIProxy:
                 buf += chunk
                 if len(buf) < 5:
                     continue
-            if buf[0] != 0x16:
+
+            if buf[0] != 0x16:  # not TLS Handshake
                 return bytes(buf)
+
             rec_len = struct.unpack('!H', buf[3:5])[0]
             total = 5 + rec_len
             while len(buf) < total:
@@ -226,9 +240,10 @@ class TLSSNIProxy:
                 if not chunk:
                     break
                 buf += chunk
-            sni = self._parse_sni(bytes(buf))
-            if sni:
+
+            if self._parse_sni(bytes(buf)):
                 return bytes(buf)
+
             more = await reader.read(2048)
             if not more:
                 break
@@ -240,41 +255,31 @@ class TLSSNIProxy:
             if len(data) < 5 or data[0] != 0x16:
                 return None
             idx = 5
-            if len(data) < idx + 4:
-                return None
-            if data[idx] != 0x01:
-                return None
-            idx += 4
-            idx += 2 + 32
-            if len(data) < idx + 1:
-                return None
-            sid_len = data[idx]
-            idx += 1 + sid_len
-            if len(data) < idx + 2:
-                return None
-            cs_len = struct.unpack('!H', data[idx:idx+2])[0]
-            idx += 2 + cs_len
-            if len(data) < idx + 1:
-                return None
-            cm_len = data[idx]
-            idx += 1 + cm_len
-            if len(data) < idx + 2:
-                return None
-            ext_total_len = struct.unpack('!H', data[idx:idx+2])[0]
-            idx += 2
+            if len(data) < idx + 4: return None
+            if data[idx] != 0x01:   return None  # ClientHello
+            idx += 4               # hs len
+            idx += 2 + 32          # client_version + random
+            if len(data) < idx + 1: return None
+            sid_len = data[idx]; idx += 1 + sid_len
+            if len(data) < idx + 2: return None
+            cs_len = struct.unpack('!H', data[idx:idx+2])[0]; idx += 2 + cs_len
+            if len(data) < idx + 1: return None
+            cm_len = data[idx]; idx += 1 + cm_len
+            if len(data) < idx + 2: return None
+            ext_total_len = struct.unpack('!H', data[idx:idx+2])[0]; idx += 2
             end = idx + ext_total_len
+
             while idx + 4 <= end and idx + 4 <= len(data):
                 ext_type = struct.unpack('!H', data[idx:idx+2])[0]
-                ext_len = struct.unpack('!H', data[idx+2:idx+4])[0]
+                ext_len  = struct.unpack('!H', data[idx+2:idx+4])[0]
                 idx += 4
-                if ext_type == 0:
-                    if idx + 2 > len(data):
-                        return None
+                if ext_type == 0:  # server_name
+                    if idx + 2 > len(data): return None
                     list_len = struct.unpack('!H', data[idx:idx+2])[0]
                     j = idx + 2
                     while j + 3 <= idx + 2 + list_len and j + 3 <= len(data):
                         name_type = data[j]
-                        name_len = struct.unpack('!H', data[j+1:j+3])[0]
+                        name_len  = struct.unpack('!H', data[j+1:j+3])[0]
                         j += 3
                         if name_type == 0 and j + name_len <= len(data):
                             host = data[j:j+name_len].decode('idna', 'ignore')
@@ -292,46 +297,60 @@ class TLSSNIProxy:
                 data = await reader.read(65536)
                 if not data:
                     break
-                writer.write(data); await writer.drain()
+                writer.write(data)
+                await writer.drain()
         except Exception:
             pass
         finally:
-            with contextlib_silent():
+            try:
                 writer.close(); await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _close(self, w: asyncio.StreamWriter):
-        with contextlib_silent():
+        try:
             w.close(); await w.wait_closed()
+        except Exception:
+            pass
 
-from contextlib import contextmanager
-
-@contextmanager
-def contextlib_silent():
-    try:
-        yield
-    except Exception:
-        pass
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 async def main():
-    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='[%(levelname)s] %(message)s')
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                        format='[%(levelname)s] %(message)s')
+
     if not _valid_ip(SINK_IPV4, 4) and not _valid_ip(SINK_IPV6, 6):
         logging.error("You must set SINK_IPV4 and/or SINK_IPV6 to valid addresses.")
         sys.exit(1)
-    loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(lambda: DNSDatagramProtocol(SINK_IPV4, SINK_IPV6), local_addr=(DNS_HOST, DNS_PORT))
-    http_proxy = HTTPTransparentProxy()
-    http_server = await asyncio.start_server(http_proxy.handle, HTTP_HOST, HTTP_PORT, reuse_port=True)
-    logging.info(f"HTTP proxy listening on {[s.getsockname() for s in http_server.sockets]}")
-    tls_proxy = TLSSNIProxy(default_port=TLS_PORT)
-    tls_server = await asyncio.start_server(tls_proxy.handle, TLS_HOST, TLS_PORT, reuse_port=True)
-    logging.info(f"TLS SNI proxy listening on {[s.getsockname() for s in tls_server.sockets]}")
-    try:
-        await asyncio.gather(http_server.serve_forever(), tls_server.serve_forever())
-    finally:
-        transport.close(); http_server.close(); tls_server.close()
-        await http_server.wait_closed(); await tls_server.wait_closed()
 
-if __name__ == '__main__':
+    loop = asyncio.get_running_loop()
+
+    # DNS server
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: DNSDatagramProtocol(SINK_IPV4, SINK_IPV6),
+        local_addr=(DNS_HOST, DNS_PORT),
+    )
+    logging.info(f"DNS sinkhole ready on {DNS_HOST}:{DNS_PORT}")
+
+    # HTTP proxy
+    http_proxy = HTTPTransparentProxy()
+    http_srv = await asyncio.start_server(http_proxy.handle, HTTP_HOST, HTTP_PORT, reuse_port=True)
+    logging.info(f"HTTP proxy listening on {[s.getsockname() for s in http_srv.sockets]}")
+
+    # TLS proxy
+    tls_proxy = TLSSNIProxy(default_port=TLS_PORT)
+    tls_srv = await asyncio.start_server(tls_proxy.handle, TLS_HOST, TLS_PORT, reuse_port=True)
+    logging.info(f"TLS SNI proxy listening on {[s.getsockname() for s in tls_srv.sockets]}")
+
+    try:
+        await asyncio.gather(http_srv.serve_forever(), tls_srv.serve_forever())
+    finally:
+        transport.close()
+        http_srv.close(); tls_srv.close()
+        await http_srv.wait_closed(); await tls_srv.wait_closed()
+
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
