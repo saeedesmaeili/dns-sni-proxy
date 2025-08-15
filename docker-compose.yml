@@ -1,24 +1,16 @@
-version: "3.9"
 services:
   dns-sni-proxy:
     build: .
-    image: local/dns-sni-proxy:latest
     container_name: dns-sni-proxy
     restart: unless-stopped
     ports:
       - "53:53/udp"
       - "80:80"
       - "443:443"
-    cap_add:
-      - NET_BIND_SERVICE
+    # No cap_add needed since we run as root in the container
     environment:
-      SINK_IPV4: "203.0.113.10"    # <- set to your server's public IPv4
-      # SINK_IPV6: "2001:db8::10"   # optional IPv6
+      SINK_IPV4: "203.0.113.10"   # <- set to your server's public IPv4
+      # SINK_IPV6: "2001:db8::10" # optional IPv6
       DNS_UPSTREAM: "1.1.1.1"
       ALLOWLIST: "example.com,corp.internal"
       LOG_LEVEL: "INFO"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
