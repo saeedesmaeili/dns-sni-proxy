@@ -1,16 +1,21 @@
 services:
-  dns-sni-proxy:
-    build: .
-    container_name: dns-sni-proxy
+  # DNS sinkhole: returns the server's IP for all A/AAAA queries
+  dns-sink:
+    build: ./dns-sink
+    container_name: dns-sink
+    network_mode: host            # binds directly to host ports
     restart: unless-stopped
-    ports:
-      - "53:53/udp"
-      - "80:80"
-      - "443:443"
-    # No cap_add needed since we run as root in the container
     environment:
-      SINK_IPV4: "203.0.113.10"   # <- set to your server's public IPv4
-      # SINK_IPV6: "2001:db8::10" # optional IPv6
-      DNS_UPSTREAM: "1.1.1.1"
-      ALLOWLIST: "example.com,corp.internal"
-      LOG_LEVEL: "INFO"
+      SINK_IPV4: "5.161.151.125"   # <-- SET THIS to your server's public IPv4
+      SINK_IPV6: "2a01:4ff:f0:1e15::/64" # optional IPv6
+      DNS_TTL: "30"
+      LOG_LEVEL: "DEBUG"
+
+  # SNI/HTTP proxy: routes TLS by SNI, HTTP by Host (no TLS termination)
+  sni-proxy:
+    image: haproxy:lts
+    container_name: sni-proxy
+    network_mode: host            # binds :80 and :443 on the host
+    restart: unless-stopped
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
