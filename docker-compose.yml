@@ -1,22 +1,21 @@
 services:
-  # DNS sinkhole: returns the server's IP for all A/AAAA queries
   dns-sink:
     build: ./dns-sink
     container_name: dns-sink
-    network_mode: host            # binds directly to host ports
     restart: unless-stopped
+    ports:
+      - "5.161.151.125:53:53/udp"  # ← set this
     environment:
-      SINK_IPV4: "5.161.151.125"   # <-- SET THIS to your server's public IPv4
-      SINK_IPV6: "2a01:4ff:f0:1e15::/64" # optional IPv6
+      SINK_IPV4: "5.161.151.125"
       DNS_TTL: "30"
-      LOG_LEVEL: "DEBUG"
+      LOG_LEVEL: "INFO"
 
-  # SNI/HTTP proxy: routes TLS by SNI, HTTP by Host (no TLS termination)
-   sni-proxy:
+  sni-proxy:
     image: haproxy:lts
     container_name: sni-proxy
-    network_mode: host
     restart: unless-stopped
+    ports:
+      - "5.161.151.125:80:80"
+      - "5.161.151.125:443:443"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-
